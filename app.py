@@ -580,7 +580,7 @@ def main():
                     corr_table.style
                     .format("{:.3f}")
                     .background_gradient(cmap="RdYlGn_r", vmin=-1, vmax=1),
-                    use_container_width=True,
+                    width="stretch",
                 )
 
     # =========================================================================
@@ -645,7 +645,7 @@ def main():
         stats_df = stats_df.set_index("Year")
         st.dataframe(
             stats_df[["Return (%)", "Vol (%)", "Sharpe", "Max DD (%)", "Note"]],
-            use_container_width=True,
+            width="stretch",
         )
 
         # Wealth chart
@@ -796,7 +796,7 @@ def main():
                     f"{sharpe_gbm:.3f}",
                 ],
             })
-            st.dataframe(cal_df, hide_index=True, use_container_width=True)
+            st.dataframe(cal_df, hide_index=True, width="stretch")
 
         # Run simulations (cached)
         initial_val          = float(port_wealth.iloc[-1])
@@ -827,7 +827,7 @@ def main():
         st.dataframe(
             pd.DataFrame(summary_rows),
             hide_index=True,
-            use_container_width=True,
+            width="stretch",
         )
 
         # Fan charts
