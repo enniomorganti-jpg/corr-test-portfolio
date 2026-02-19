@@ -1,0 +1,8 @@
+data/
+__pycache__/
+.ipynb_checkpoints/
+.virtual_documents/
+.DS_Store
+*.pyc
+fund_auditor.ipynb
+portfolio_tool.ipynb
