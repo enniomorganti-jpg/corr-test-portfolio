@@ -438,7 +438,7 @@ def render_sidebar(uploaded_files) -> dict:
         n_sims = st.select_slider(
             "Simulations",
             options=[500, 1_000, 2_000, 5_000, 10_000],
-            value=5_000,
+            value=1_000,
         )
         block_length = st.slider(
             "Block length (trading days)",
@@ -798,62 +798,82 @@ def main():
             })
             st.dataframe(cal_df, hide_index=True, width="stretch")
 
-        # Run simulations (cached)
-        initial_val          = float(port_wealth.iloc[-1])
-        port_returns_tuple   = tuple(port_returns.values.tolist())
-        mc_results           = run_monte_carlo_cached(
-            port_returns_tuple=port_returns_tuple,
-            initial_value=initial_val,
-            n_sims=n_sims,
-            block_length=block_length,
+        # Run simulations only when button is clicked (avoids OOM on cloud)
+        initial_val        = float(port_wealth.iloc[-1])
+        port_returns_tuple = tuple(port_returns.values.tolist())
+        mc_params_key      = (port_returns_tuple, initial_val, n_sims, block_length)
+
+        run_clicked = st.button("▶ Run simulations", type="primary")
+
+        # Persist results in session_state; invalidate when params change
+        if run_clicked:
+            mc_results = run_monte_carlo_cached(
+                port_returns_tuple=port_returns_tuple,
+                initial_value=initial_val,
+                n_sims=n_sims,
+                block_length=block_length,
+            )
+            st.session_state["mc_results"] = mc_results
+            st.session_state["mc_params"]  = mc_params_key
+
+        mc_results = (
+            st.session_state.get("mc_results")
+            if st.session_state.get("mc_params") == mc_params_key
+            else None
         )
 
-        gbm_paths  = mc_results["gbm"]
-        boot_paths = mc_results["bootstrap"]
+        if mc_results is None:
+            st.info(
+                "Configure the portfolio in the sidebar, then click **▶ Run simulations**.\n\n"
+                f"Current settings: **{n_sims:,} simulations**, block length **{block_length}**."
+            )
+        else:
+            gbm_paths  = mc_results["gbm"]
+            boot_paths = mc_results["bootstrap"]
 
-        # Terminal value summary table
-        st.subheader("Terminal Value Summary")
-        summary_rows = []
-        for horizon in (10, 20, 30):
-            for method, paths in [("GBM", gbm_paths), ("Block Bootstrap", boot_paths)]:
-                terminal = paths[horizon][-1]
-                summary_rows.append({
-                    "Horizon": f"{horizon} yr",
-                    "Method":  method,
-                    "5th pct (EUR)":  f"{np.percentile(terminal, 5):,.0f}",
-                    "Median (EUR)":   f"{np.median(terminal):,.0f}",
-                    "95th pct (EUR)": f"{np.percentile(terminal, 95):,.0f}",
-                })
-        st.dataframe(
-            pd.DataFrame(summary_rows),
-            hide_index=True,
-            width="stretch",
-        )
+            # Terminal value summary table
+            st.subheader("Terminal Value Summary")
+            summary_rows = []
+            for horizon in (10, 20, 30):
+                for method, paths in [("GBM", gbm_paths), ("Block Bootstrap", boot_paths)]:
+                    terminal = paths[horizon][-1]
+                    summary_rows.append({
+                        "Horizon": f"{horizon} yr",
+                        "Method":  method,
+                        "5th pct (EUR)":  f"{np.percentile(terminal, 5):,.0f}",
+                        "Median (EUR)":   f"{np.median(terminal):,.0f}",
+                        "95th pct (EUR)": f"{np.percentile(terminal, 95):,.0f}",
+                    })
+            st.dataframe(
+                pd.DataFrame(summary_rows),
+                hide_index=True,
+                width="stretch",
+            )
 
-        # Fan charts
-        port_wealth_full = pd.concat([
-            pd.Series([portfolio_eur], index=[prices_selected.index[0]]),
-            port_wealth,
-        ])
-        fig = make_fan_chart(
-            gbm_paths=gbm_paths,
-            boot_paths=boot_paths,
-            port_wealth_full=port_wealth_full,
-            initial_val=initial_val,
-            n_sims=n_sims,
-            port_returns_index=port_returns.index,
-        )
-        st.pyplot(fig)
-        plt.close(fig)
+            # Fan charts
+            port_wealth_full = pd.concat([
+                pd.Series([portfolio_eur], index=[prices_selected.index[0]]),
+                port_wealth,
+            ])
+            fig = make_fan_chart(
+                gbm_paths=gbm_paths,
+                boot_paths=boot_paths,
+                port_wealth_full=port_wealth_full,
+                initial_val=initial_val,
+                n_sims=n_sims,
+                port_returns_index=port_returns.index,
+            )
+            st.pyplot(fig)
+            plt.close(fig)
 
-        st.markdown("""
+            st.markdown("""
 **Interpretation:**
 - The **gray line** shows actual historical portfolio wealth (before t = 0).
 - The **dark band** (25th–75th percentile) is the central 50% of simulated outcomes.
 - The **light band** (5th–95th percentile) is the 90% probability interval.
 - **GBM** assumes log-normal returns. **Block Bootstrap** resamples actual return sequences, preserving fat tails and autocorrelation.
 - The Block Bootstrap 5th-percentile is a useful stress scenario: it has a 5% chance of occurring.
-        """)
+            """)
 
 
 if __name__ == "__main__":
