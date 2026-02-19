@@ -25,6 +25,7 @@ import matplotlib.ticker as mticker
 
 import seaborn as sns
 import streamlit as st
+from scipy.optimize import minimize
 
 # Ensure local modules (loader.py, engine.py, metrics.py) are importable
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -374,6 +375,119 @@ def make_fan_chart(
 # BLOCK 4 — SIDEBAR
 # =============================================================================
 
+# =============================================================================
+# BLOCK 2b — ANALYTICAL HELPERS (Optimizer, Risk, Drawdowns)
+# =============================================================================
+
+def _portfolio_stats(w, mean_ann, cov_ann, rf):
+    """Return (annualised_return, annualised_vol, sharpe) for weight vector w."""
+    r = float(w @ mean_ann)
+    v = float(np.sqrt(max(w @ cov_ann @ w, 1e-12)))
+    s = (r - rf) / v if v > 1e-9 else np.nan
+    return r, v, s
+
+
+def compute_efficient_frontier(mean_ann, cov_ann, rf, n_random=3_000, seed=0):
+    """
+    Generate random portfolios and find the two optimal points.
+
+    Returns a dict with:
+      rand_r, rand_v, rand_s  — return/vol/Sharpe for each random portfolio
+      w_max_sharpe            — weights of the max-Sharpe portfolio
+      w_min_var               — weights of the min-variance portfolio
+    """
+    n = len(mean_ann)
+    rng = np.random.default_rng(seed)
+
+    # Dirichlet(1,...,1) gives uniform coverage of the weight simplex
+    rand_w = rng.dirichlet(np.ones(n), size=n_random)
+    rand_r = rand_w @ mean_ann
+    rand_v = np.sqrt(np.einsum('ij,jk,ik->i', rand_w, cov_ann, rand_w))
+    rand_s = (rand_r - rf) / np.where(rand_v > 1e-9, rand_v, np.nan)
+
+    bounds = [(0.0, 1.0)] * n
+    cons   = [{'type': 'eq', 'fun': lambda w: w.sum() - 1.0}]
+    w0     = np.ones(n) / n
+
+    res_ms = minimize(
+        lambda w: -((w @ mean_ann - rf) / max(float(np.sqrt(w @ cov_ann @ w)), 1e-9)),
+        w0, method='SLSQP', bounds=bounds, constraints=cons,
+    )
+    res_mv = minimize(
+        lambda w: float(w @ cov_ann @ w),
+        w0, method='SLSQP', bounds=bounds, constraints=cons,
+    )
+
+    w_ms = res_ms.x / res_ms.x.sum()
+    w_mv = res_mv.x / res_mv.x.sum()
+
+    return {
+        'rand_r': rand_r, 'rand_v': rand_v, 'rand_s': rand_s,
+        'w_max_sharpe': w_ms, 'w_min_var': w_mv,
+    }
+
+
+def compute_risk_contribution(w_arr, cov_ann):
+    """
+    Decompose portfolio volatility into per-asset contributions.
+
+    RC_i = w_i * (Σw)_i / sqrt(w'Σw)
+
+    Returns (rc_array, port_vol_annual) where rc_array sums to port_vol.
+    """
+    port_vol = float(np.sqrt(max(w_arr @ cov_ann @ w_arr, 1e-12)))
+    mrc = cov_ann @ w_arr          # marginal risk contribution vector
+    rc  = w_arr * mrc / port_vol   # component contributions, sum = port_vol
+    return rc, port_vol
+
+
+def find_drawdowns(wealth_series, n=5):
+    """
+    Identify the N worst drawdown episodes from a cumulative wealth series.
+
+    Returns a list of dicts (sorted worst-first) with keys:
+    Start, Trough, Recovery, Max DD (%), Days to trough, Recovery days.
+    """
+    dd = wealth_series / wealth_series.cummax() - 1
+
+    episodes = []
+    start = None
+
+    for i in range(len(dd)):
+        val  = float(dd.iloc[i])
+        date = dd.index[i]
+
+        if val < -0.005 and start is None:       # new drawdown begins
+            start = date
+        elif val >= -0.001 and start is not None: # drawdown ends (recovery)
+            ep = dd[start:date]
+            ti = int(ep.values.argmin())
+            episodes.append({
+                'Start':          start.date(),
+                'Trough':         ep.index[ti].date(),
+                'Recovery':       date.date(),
+                'Max DD (%)':     round(float(ep.values[ti]) * 100, 1),
+                'Days to trough': (ep.index[ti] - start).days,
+                'Recovery days':  (date - ep.index[ti]).days,
+            })
+            start = None
+
+    if start is not None:  # still in drawdown at end of series
+        ep = dd[start:]
+        ti = int(ep.values.argmin())
+        episodes.append({
+            'Start':          start.date(),
+            'Trough':         ep.index[ti].date(),
+            'Recovery':       'Ongoing',
+            'Max DD (%)':     round(float(ep.values[ti]) * 100, 1),
+            'Days to trough': (ep.index[ti] - start).days,
+            'Recovery days':  None,
+        })
+
+    episodes.sort(key=lambda x: x['Max DD (%)'])
+    return episodes[:n]
+
+
 def render_sidebar(uploaded_files) -> dict:
     """Render sidebar controls. Returns a config dict for the main area."""
 
@@ -538,11 +652,15 @@ def main():
     # =========================================================================
     # TABS
     # =========================================================================
-    tab_corr, tab_bt, tab_div, tab_mc = st.tabs([
+    tab_corr, tab_bt, tab_div, tab_mc, tab_ef, tab_rc, tab_roll, tab_dd = st.tabs([
         "📊 Correlation",
         "📈 Backtest",
         "🔀 Diversification",
         "🎲 Monte Carlo",
+        "🎯 Optimizer",
+        "⚖️ Risk",
+        "🔄 Rolling Corr",
+        "📉 Drawdowns",
     ])
 
     # =========================================================================
@@ -874,6 +992,281 @@ def main():
 - **GBM** assumes log-normal returns. **Block Bootstrap** resamples actual return sequences, preserving fat tails and autocorrelation.
 - The Block Bootstrap 5th-percentile is a useful stress scenario: it has a 5% chance of occurring.
             """)
+
+
+    # =========================================================================
+    # TAB 5 — OPTIMIZER (EFFICIENT FRONTIER)
+    # =========================================================================
+    with tab_ef:
+        st.header("Portfolio Optimizer — Efficient Frontier")
+
+        st.markdown("""
+**How to read this chart:**
+Each dot is a *different random combination* of your ETFs — thousands of hypothetical portfolios.
+The **horizontal axis** is risk (annual volatility) and the **vertical axis** is return.
+The colour shows the **Sharpe ratio** (return per unit of risk taken): green = better, red = worse.
+
+- 🟦 **Square** = your current portfolio
+- ⭐ **Star** = the mathematically optimal portfolio (highest Sharpe ratio)
+- 🔷 **Diamond** = the minimum-variance portfolio (lowest possible risk)
+
+If your square is far from the star, it means you could get the same return with less risk (or more return with the same risk) by adjusting the weights.
+        """)
+
+        if len(tickers) < 2:
+            st.warning("Upload at least 2 ETFs to compute the efficient frontier.")
+        else:
+            mean_ann = etf_returns[tickers].mean() * 252
+            cov_ann  = etf_returns[tickers].cov()  * 252
+
+            with st.spinner("Computing efficient frontier…"):
+                ef = compute_efficient_frontier(
+                    mean_ann.values, cov_ann.values, risk_free_annual
+                )
+
+            r_cur, v_cur, s_cur = _portfolio_stats(w_arr, mean_ann.values, cov_ann.values, risk_free_annual)
+            r_ms,  v_ms,  s_ms  = _portfolio_stats(ef['w_max_sharpe'], mean_ann.values, cov_ann.values, risk_free_annual)
+            r_mv,  v_mv,  s_mv  = _portfolio_stats(ef['w_min_var'],    mean_ann.values, cov_ann.values, risk_free_annual)
+
+            # --- Frontier scatter ---
+            fig, ax = plt.subplots(figsize=(10, 6))
+            sc = ax.scatter(
+                ef['rand_v'] * 100, ef['rand_r'] * 100,
+                c=ef['rand_s'], cmap='RdYlGn',
+                alpha=0.35, s=8,
+                vmin=0, vmax=float(np.nanpercentile(ef['rand_s'], 95)),
+            )
+            plt.colorbar(sc, ax=ax, label='Sharpe Ratio')
+
+            ax.scatter([v_cur*100], [r_cur*100], marker='s', s=180,
+                       color='#1565C0', zorder=10,
+                       label=f'Your portfolio  (Sharpe {s_cur:.2f})')
+            ax.scatter([v_ms*100], [r_ms*100], marker='*', s=350,
+                       color='gold', edgecolors='black', linewidths=0.6, zorder=11,
+                       label=f'Max Sharpe  (Sharpe {s_ms:.2f})')
+            ax.scatter([v_mv*100], [r_mv*100], marker='D', s=130,
+                       color='#7B1FA2', edgecolors='black', linewidths=0.6, zorder=11,
+                       label=f'Min Variance  (Sharpe {s_mv:.2f})')
+
+            ax.set_xlabel('Annualised Volatility (%)', fontsize=10)
+            ax.set_ylabel('Annualised Return (%)',     fontsize=10)
+            ax.set_title('Efficient Frontier — 3,000 Random Weight Combinations',
+                         fontsize=12, fontweight='bold')
+            ax.legend(fontsize=9, framealpha=0.9)
+            ax.spines[['top', 'right']].set_visible(False)
+            fig.tight_layout()
+            st.pyplot(fig)
+            plt.close(fig)
+
+            # --- Weight comparison table ---
+            st.subheader("Weight Comparison")
+            st.caption("How your current weights compare to the two optimal portfolios.")
+            cmp_df = pd.DataFrame({
+                'ETF':          tickers,
+                'Your weights': [f"{w:.1%}" for w in w_arr],
+                'Max Sharpe':   [f"{w:.1%}" for w in ef['w_max_sharpe']],
+                'Min Variance': [f"{w:.1%}" for w in ef['w_min_var']],
+            })
+            st.dataframe(cmp_df, hide_index=True, width='stretch')
+
+            col1, col2, col3 = st.columns(3)
+            col1.metric("Your Sharpe",       f"{s_cur:.3f}")
+            col2.metric("Max-Sharpe Sharpe", f"{s_ms:.3f}",
+                        delta=f"{s_ms - s_cur:+.3f}")
+            col3.metric("Min-Var Volatility", f"{v_mv*100:.1f}%",
+                        delta=f"{(v_mv - v_cur)*100:+.1f}%")
+
+    # =========================================================================
+    # TAB 6 — RISK CONTRIBUTION
+    # =========================================================================
+    with tab_rc:
+        st.header("Risk Contribution")
+
+        st.markdown("""
+**What this shows:**
+Your portfolio weight (e.g. 15%) and your actual **risk contribution** are not the same thing.
+A highly volatile asset or one that moves closely with others can consume far more than its share of total portfolio risk.
+
+- **Blue bars** = what you allocated (weight %)
+- **Red bars** = how much of the portfolio's total volatility this ETF actually drives (risk contribution %)
+
+An ETF whose red bar is much taller than its blue bar is *punching above its weight* in risk terms.
+        """)
+
+        cov_ann_rc = etf_returns[tickers].cov() * 252
+        rc_arr, port_vol_rc = compute_risk_contribution(w_arr, cov_ann_rc.values)
+        rc_pct = rc_arr / rc_arr.sum() * 100
+        w_pct  = w_arr * 100
+
+        fig, ax = plt.subplots(figsize=(max(7, len(tickers) * 1.4), 5))
+        x      = np.arange(len(tickers))
+        width  = 0.35
+        bars_w = ax.bar(x - width/2, w_pct,  width, color='#1565C0', alpha=0.85, label='Allocation weight (%)')
+        bars_r = ax.bar(x + width/2, rc_pct, width, color='#C62828', alpha=0.85, label='Risk contribution (%)')
+
+        for bar in bars_w:
+            ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.3,
+                    f'{bar.get_height():.1f}%', ha='center', va='bottom', fontsize=8, color='#1565C0')
+        for bar in bars_r:
+            ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.3,
+                    f'{bar.get_height():.1f}%', ha='center', va='bottom', fontsize=8, color='#C62828')
+
+        ax.set_xticks(x)
+        ax.set_xticklabels(tickers, rotation=20, ha='right')
+        ax.set_ylabel('%')
+        ax.set_title('Weight vs Risk Contribution per ETF', fontsize=12, fontweight='bold')
+        ax.legend(fontsize=9)
+        ax.spines[['top', 'right']].set_visible(False)
+        fig.tight_layout()
+        st.pyplot(fig)
+        plt.close(fig)
+
+        # Detail table
+        rc_df = pd.DataFrame({
+            'ETF':                   tickers,
+            'Allocation weight (%)': [round(v, 1) for v in w_pct],
+            'Risk contribution (%)': [round(v, 1) for v in rc_pct],
+            'Difference (pp)':       [round(r - w, 1) for r, w in zip(rc_pct, w_pct)],
+        })
+        st.dataframe(rc_df, hide_index=True, width='stretch')
+        st.caption(
+            f"Portfolio annualised volatility: **{port_vol_rc*100:.2f}%**. "
+            "Risk contributions sum to 100% of that volatility."
+        )
+
+    # =========================================================================
+    # TAB 7 — ROLLING CORRELATIONS
+    # =========================================================================
+    with tab_roll:
+        st.header("Rolling Correlations")
+
+        st.markdown("""
+**What this shows:**
+Correlation measures how similarly two assets move day-to-day (1 = identical, 0 = unrelated, -1 = opposite).
+A *rolling* correlation recalculates this over a moving window so you can see how it changes over time.
+
+**The key insight:** In normal markets, assets can be relatively uncorrelated and provide diversification.
+But during a market crash, correlations often **spike toward 1** — everything falls together —
+reducing the diversification benefit exactly when you need it most.
+
+- **Thin coloured lines** = each pair of ETFs
+- **Bold black line** = average correlation across all pairs
+- A spike in the black line means your portfolio temporarily became much less diversified.
+        """)
+
+        if len(tickers) < 2:
+            st.warning("Upload at least 2 ETFs to compute rolling correlations.")
+        else:
+            window = st.select_slider(
+                "Rolling window",
+                options=[63, 126, 252],
+                value=126,
+                format_func=lambda x: {63: "3 months (63 days)", 126: "6 months (126 days)",
+                                        252: "1 year (252 days)"}[x],
+            )
+
+            pairs = [(t1, t2) for i, t1 in enumerate(tickers)
+                               for j, t2 in enumerate(tickers) if j > i]
+
+            pair_series = {}
+            for t1, t2 in pairs:
+                pair_series[(t1, t2)] = (
+                    etf_returns[t1].rolling(window).corr(etf_returns[t2])
+                )
+
+            avg_rc = pd.concat(pair_series.values(), axis=1).mean(axis=1)
+
+            colors_rc = plt.cm.tab20(np.linspace(0, 1, len(pairs)))
+            fig, ax = plt.subplots(figsize=(13, 5))
+
+            for (t1, t2), color in zip(pairs, colors_rc):
+                ax.plot(pair_series[(t1, t2)].index,
+                        pair_series[(t1, t2)].values,
+                        lw=0.9, alpha=0.45, color=color, label=f'{t1}–{t2}')
+
+            ax.plot(avg_rc.index, avg_rc.values,
+                    color='black', lw=2.2, label='Average correlation', zorder=5)
+
+            ax.axhline(0, color='gray', lw=0.7, ls='--', alpha=0.5)
+            ax.axhline(1, color='gray', lw=0.7, ls='--', alpha=0.5)
+
+            # Shade COVID crash if within data range
+            covid_start = pd.Timestamp('2020-02-20')
+            covid_end   = pd.Timestamp('2020-04-01')
+            data_start  = etf_returns.index[0]
+            data_end    = etf_returns.index[-1]
+            if covid_start >= data_start and covid_end <= data_end:
+                ax.axvspan(covid_start, covid_end, alpha=0.12, color='red',
+                           label='COVID crash (Feb–Apr 2020)')
+
+            ax.set_ylim(-0.3, 1.05)
+            ax.set_ylabel('Pearson correlation')
+            ax.set_title(
+                f'Rolling {window}-Day Pairwise Correlations',
+                fontsize=12, fontweight='bold'
+            )
+            ax.legend(fontsize=7.5, loc='lower left', ncol=2, framealpha=0.9)
+            ax.spines[['top', 'right']].set_visible(False)
+            fig.autofmt_xdate()
+            fig.tight_layout()
+            st.pyplot(fig)
+            plt.close(fig)
+
+    # =========================================================================
+    # TAB 8 — DRAWDOWNS
+    # =========================================================================
+    with tab_dd:
+        st.header("Drawdown Analysis")
+
+        st.markdown("""
+**What this shows:**
+A drawdown is how far your portfolio has fallen from its most recent **peak value**.
+The underwater chart shows every day where you were below a previous high — the area shaded in red
+is money you had and then temporarily lost.
+
+- A **deep, brief** trough = a sharp crash followed by fast recovery (e.g. COVID 2020)
+- A **shallow, long** trough = a slow grinding decline (harder psychologically)
+- **Recovery days** = how many trading days it took to get back to the previous peak
+
+The table ranks the worst episodes in your historical data.
+        """)
+
+        start_date       = prices_selected.index[0]
+        port_wealth_full = pd.concat([
+            pd.Series([portfolio_eur], index=[start_date]),
+            port_wealth,
+        ])
+        underwater = port_wealth_full / port_wealth_full.cummax() - 1
+
+        fig, ax = plt.subplots(figsize=(13, 4))
+        ax.fill_between(underwater.index, underwater.values * 100, 0,
+                        color='#C62828', alpha=0.40, label='Drawdown')
+        ax.plot(underwater.index, underwater.values * 100,
+                color='#C62828', lw=1.0)
+        ax.axhline(0, color='black', lw=0.8)
+        ax.set_ylabel('Drawdown (%)')
+        ax.set_title(
+            f'Portfolio Underwater Chart — {port_start} to {prices_selected.index[-1].date()}',
+            fontsize=12, fontweight='bold'
+        )
+        ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda v, _: f'{v:.0f}%'))
+        ax.spines[['top', 'right']].set_visible(False)
+        fig.autofmt_xdate()
+        fig.tight_layout()
+        st.pyplot(fig)
+        plt.close(fig)
+
+        # Top drawdown episodes table
+        st.subheader("Worst Drawdown Episodes")
+        episodes = find_drawdowns(port_wealth_full, n=5)
+        if episodes:
+            dd_df = pd.DataFrame(episodes)
+            dd_df['Recovery days'] = dd_df['Recovery days'].apply(
+                lambda x: str(x) if x is not None else 'Ongoing'
+            )
+            st.dataframe(dd_df, hide_index=True, width='stretch')
+        else:
+            st.info("No significant drawdowns found in the data.")
 
 
 if __name__ == "__main__":
