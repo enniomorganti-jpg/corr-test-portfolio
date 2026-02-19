@@ -640,7 +640,9 @@ def main():
             "Note": f"{total_years:.1f} yrs",
         })
 
-        stats_df = pd.DataFrame(rows).set_index("Year")
+        stats_df = pd.DataFrame(rows)
+        stats_df["Year"] = stats_df["Year"].astype(str)
+        stats_df = stats_df.set_index("Year")
         st.dataframe(
             stats_df[["Return (%)", "Vol (%)", "Sharpe", "Max DD (%)", "Note"]],
             use_container_width=True,
